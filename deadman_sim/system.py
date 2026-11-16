@@ -121,7 +121,13 @@ class Module:
             self._healthy_since = None
             self.runtime_fault = True
             self.last_error = str(exc)
-            return dict(success=False, error=str(exc))
+            try:
+                slot = self.read_slot()
+            except HardwareFailure:
+                return dict(success=False, error=str(exc), slot_unknown=True,
+                            slot=None, slot_empty=None)
+            return dict(success=False, error=str(exc), slot_unknown=False,
+                        slot=slot, slot_empty=slot is None)
 
     def _record(self, *, state=None, control=None, **values):
         loaded = self.ledger.load()
@@ -235,6 +241,9 @@ class Module:
             return dict(success=False, status=loaded.status.value, slot=slot,
                         slot_empty=slot is None, state=State.UNKNOWN.value)
         state = loaded.state
+        if state["state"] == State.FAULT.value and state["control"].get("fault_latched"):
+            self.ledger.write_cache()
+            return dict(success=True, state=State.FAULT.value, slot=slot)
         for record in list(state["pending_txs"].values()):
             if record["type"] == "BOOT":
                 if record["source_boot_id"] == self.boot_id:
@@ -273,8 +282,11 @@ class Module:
                 except HardwareFailure as exc:
                     return self._failed(tx, exc)
             elif slot is None and trusted and self.sensors.healthy():
-                self._record(state=State.ARM_PENDING, operation="abort",
-                             result=dict(abort_tx=record["tx_id"]), control=dict(retry=True))
+                if record["type"] == "INTENT":
+                    self._stop(State.FAULT, "interrupted reboot has no wakealarm")
+                else:
+                    self._record(state=State.ARM_PENDING, operation="abort",
+                                 result=dict(abort_tx=record["tx_id"]), control=dict(retry=True))
             else:
                 final_state = State.QUARANTINE if not trusted else State.UNKNOWN
                 self._stop(final_state,
@@ -283,6 +295,8 @@ class Module:
                     self._clear_owned(final_state=final_state)
         loaded = self.ledger.load()
         state = loaded.state
+        if not state["pending_txs"] and state["state"] == State.ARM_PENDING.value and slot is not None:
+            self._stop(State.QUARANTINE, "foreign slot during pending retry")
         if not state["pending_txs"] and state["state"] == State.ARMED.value:
             if not self._trusted_time(state["last_samples"]):
                 if state["last_samples"].get("boot_id") != self.boot_id:
