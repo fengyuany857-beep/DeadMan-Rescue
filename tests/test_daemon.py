@@ -1,8 +1,47 @@
+import json
+import subprocess
+import sys
+
 from deadman_sim.ledger import State
 from support import ModuleCase
 
 
 class DaemonTests(ModuleCase):
+    def test_separate_process_cannot_take_live_owner_but_can_recover_dead_owner(self):
+        self.arm()
+        script = """
+import json
+from pathlib import Path
+import sys
+from deadman_sim.clock import SimClock
+from deadman_sim.system import Module
+root, boot, elapsed, mono, wall = json.loads(sys.argv[1])
+clock = SimClock(wall=wall, elapsed=elapsed)
+clock.boot_id = boot
+clock._boot_start = elapsed - mono
+module = Module(root, Path(root) / 'hardware', clock)
+print(json.dumps(dict(recover=module.recover(), tick=module.tick())))
+"""
+        def contender():
+            payload = json.dumps([str(self.root), self.clock.boot_id, self.clock.elapsed,
+                                  self.clock.monotonic(), self.clock.wall()])
+            result = subprocess.run([sys.executable, "-c", script, payload], check=True,
+                                    capture_output=True, text=True)
+            return json.loads(result.stdout)
+        seq = self.module.ledger.load().seq
+        live = contender()
+        self.assertFalse(live["recover"]["success"])
+        self.assertFalse(live["tick"]["success"])
+        self.assertEqual(self.module.ledger.load().seq, seq)
+        self.assertTrue(self.module.tick()["success"])
+        self.module.close()
+        recovered = contender()
+        self.assertTrue(recovered["recover"]["success"])
+        self.assertTrue(recovered["tick"]["success"])
+        self.module = self.make_module()
+        self.assertTrue(self.module.recover()["success"])
+        self.assertTrue(self.module.tick()["success"])
+
     def test_stop_generation_upgrade_blocks_old_instance(self):
         self.arm()
         old_stop = self.module.expected_stop

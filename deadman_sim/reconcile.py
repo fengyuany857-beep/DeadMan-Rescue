@@ -69,7 +69,7 @@ def reconcile(module, evidence=None):
                     rtc_samples=[module.rtc.read_counter()], mono_samples=[module.clock.monotonic()])
         module.crash.hit("boot_before_observation")
         module.ledger.append(emergency=True, phase="PREPARED", **base)
-        module._owners.pop((module.root, module.boot_id), None)
+        module._release_owner()
         module.crash.hit("boot_after_observation")
     if not module._known_own(slot, loaded):
         module._stop(State.QUARANTINE, "unknown boot slot")

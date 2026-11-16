@@ -10,10 +10,12 @@ class IdentityChanged(RuntimeError):
 
 
 class SharedLock:
-    def __init__(self, root, state_name="deadman-rescue"):
+    def __init__(self, root, state_name="deadman-rescue", lock_name=".deadman-rescue.lock"):
         self.root = Path(root).absolute()
         self.state_dir = self.root / state_name
-        self.path = self.root / ".deadman-rescue.lock"
+        if Path(lock_name).name != lock_name:
+            raise ValueError("flat lock path required")
+        self.path = self.root / lock_name
         Storage(self.state_dir)
         if self.path.is_symlink():
             raise ValueError("symlink lock")

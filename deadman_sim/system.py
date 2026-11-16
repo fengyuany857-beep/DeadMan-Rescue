@@ -3,7 +3,6 @@ import json
 import math
 from pathlib import Path
 import uuid
-import weakref
 
 from . import params
 from .budget import fresh_budget, reserve
@@ -19,8 +18,6 @@ from .storage import Storage
 
 
 class Module:
-    _owners = weakref.WeakValueDictionary()
-
     def __init__(self, root, hardware_dir, clock, sensors=None, crash=None, config=None):
         self.root = Path(root).absolute()
         self.clock, self.boot_id = clock, clock.boot_id
@@ -47,18 +44,34 @@ class Module:
         self.manual_intervention = False
         self.maintenance = False
         self._healthy_since = None
+        self._instance_lock = None
 
     def _can_claim(self):
-        owner = self._owners.get((self.root, self.boot_id))
-        return owner is None or owner is self or owner.closed or owner.crashed
+        if self._instance_lock is None:
+            self._instance_lock = SharedLock(self.root, lock_name=".deadman-rescue.instance.lock")
+        if self._instance_lock.held:
+            self._instance_lock.require()
+            return True
+        try:
+            self._instance_lock.acquire()
+            return True
+        except BlockingIOError:
+            return False
 
     def _claim(self):
-        self._owners[(self.root, self.boot_id)] = self
+        self._instance_lock.require()
+
+    def _release_owner(self):
+        if self._instance_lock is not None:
+            self._instance_lock.release()
 
     def close(self):
         if self.closed:
             return
         self.closed = True
+        if self._instance_lock is not None:
+            self._instance_lock.close()
+            self._instance_lock = None
         self.rtc.close()
         self.lock.close()
 
@@ -111,6 +124,7 @@ class Module:
         except SimulatedCrash:
             self._healthy_since = None
             self.crashed = True
+            self._release_owner()
             raise
         except HardwareFailure as exc:
             self._healthy_since = None
@@ -181,7 +195,7 @@ class Module:
 
     def _stop(self, state=State.STAND_DOWN, reason="stopped"):
         current = self.ledger.load().state
-        self._owners.pop((self.root, self.boot_id), None)
+        self._release_owner()
         control = dict(enabled=False, supervisor_permit=False, retry=False)
         if state in (State.FAULT, State.QUARANTINE):
             control["fault_latched"] = True
@@ -241,6 +255,9 @@ class Module:
             return dict(success=False, status=loaded.status.value, slot=slot,
                         slot_empty=slot is None, state=State.UNKNOWN.value)
         state = loaded.state
+        if (state["control"].get("enabled") and state["control"].get("boot_id") == self.boot_id and
+                not self._can_claim()):
+            return dict(success=False, skipped=True, error="live daemon owner")
         if state["state"] == State.FAULT.value and state["control"].get("fault_latched"):
             self.ledger.write_cache()
             return dict(success=True, state=State.FAULT.value, slot=slot)
@@ -308,6 +325,8 @@ class Module:
             elif slot != state["last_alarm"]:
                 self._stop(State.QUARANTINE, "slot conflict")
         state = self.ledger.load().state
+        if not state["control"].get("enabled"):
+            self._release_owner()
         if claim and state["control"].get("enabled") and state["state"] in (
                 State.ARMED.value, State.ARM_PENDING.value, State.DISARMED.value):
             if not self._can_claim():
@@ -329,8 +348,6 @@ class Module:
             if loaded.status != LoadStatus.OK:
                 return dict(success=False, error=loaded.status.value)
             state = loaded.state
-            if not self._can_claim():
-                return dict(success=False, skipped=True, error="live daemon owner")
             if state["state"] not in (State.DISARMED.value, State.STAND_DOWN.value):
                 return dict(success=False, error="state not eligible")
             if state["control"].get("fault_latched"):
@@ -348,6 +365,8 @@ class Module:
                 budget = reserve(state["budget"], self.boot_id)
             except ValueError:
                 return dict(success=False, error="budget exhausted")
+            if not self._can_claim():
+                return dict(success=False, skipped=True, error="live daemon owner")
             self._record(state=State.DISARMED, operation="enable", budget=budget,
                          control=dict(enabled=True, supervisor_permit=True, owner=self.token,
                                       retry=False, boot_id=self.boot_id))
@@ -370,7 +389,10 @@ class Module:
                     not control.get("supervisor_permit") or
                     state["stop_generation"] != getattr(self, "expected_stop", None) or
                     self.boot_id != control.get("boot_id")):
+                self._release_owner()
                 return dict(success=False, skipped=True, error="no renewal permit")
+            if not self._can_claim():
+                return dict(success=False, skipped=True, error="live daemon owner")
             if state["state"] not in (State.ARMED.value, State.DISARMED.value,
                                       State.ARM_PENDING.value):
                 return dict(success=False, skipped=True, error="state prohibits renewal")
