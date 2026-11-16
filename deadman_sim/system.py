@@ -258,7 +258,7 @@ class Module:
             return dict(success=False, status=loaded.status.value, slot=slot,
                         slot_empty=slot is None, state=State.UNKNOWN.value)
         state = loaded.state
-        if (state["control"].get("enabled") and state["control"].get("boot_id") == self.boot_id and
+        if (claim and state["control"].get("enabled") and state["control"].get("boot_id") == self.boot_id and
                 not self._can_claim()):
             return dict(success=False, skipped=True, error="live daemon owner")
         if state["state"] == State.FAULT.value and state["control"].get("fault_latched"):

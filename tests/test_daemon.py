@@ -7,6 +7,31 @@ from support import ModuleCase
 
 
 class DaemonTests(ModuleCase):
+    def test_non_claiming_helpers_do_not_block_replacement_daemon(self):
+        self.arm()
+        self.module.close()
+        for entry in ("observe_health", "recover_without_claim", "state"):
+            with self.subTest(entry=entry):
+                helper = self.make_module()
+                replacement = self.make_module()
+                try:
+                    owner = helper.ledger.load().state["control"]["owner"]
+                    if entry == "observe_health":
+                        helper.observe_health()
+                    elif entry == "recover_without_claim":
+                        helper._entry(helper._recover_locked, recover=False)
+                    else:
+                        self.assertEqual(helper.state, State.ARMED)
+                    self.assertEqual(helper.ledger.load().state["control"]["owner"], owner)
+                    self.assertTrue(replacement.recover()["success"])
+                    self.clock.advance(60)
+                    self.assertTrue(replacement.tick()["success"])
+                    self.assertEqual(replacement.rtc.read_alarm() - replacement.rtc.read_counter(), 600)
+                    self.assertIsNone(helper._instance_lock)
+                finally:
+                    replacement.close()
+                    helper.close()
+
     def test_separate_process_cannot_take_live_owner_but_can_recover_dead_owner(self):
         self.arm()
         script = """
