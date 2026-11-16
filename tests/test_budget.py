@@ -4,6 +4,30 @@ from support import ModuleCase
 
 
 class BudgetTests(ModuleCase):
+    def test_interrupted_rescue_reconciliation_cannot_be_refunded_by_later_reboot(self):
+        self.arm()
+        reboot = self.module.request_reboot()
+        self.module.close()
+        self.clock.new_boot()
+        self.module = self.make_module()
+        self.module.crash = CrashInjector("boot_after_clear_evidence")
+        rescue_boot = self.clock.boot_id
+        with self.assertRaises(SimulatedCrash):
+            self.module.boot(Evidence("rtc_wake", True, reboot["arm_id"], True, False, True))
+        result = self.new_boot(Evidence("normal_reboot", True, reboot["arm_id"], True, False, False))
+        self.assertTrue(result["success"])
+        state = self.module.ledger.load().state
+        self.assertEqual(state["budget"]["used"], 1)
+        self.assertEqual(state["budget"]["reserved"], 0)
+        self.assertEqual(result["conclusion"], "REBOOT_OUTCOME_UNKNOWN")
+        self.assertEqual(state["pending_txs"], {})
+        self.assertEqual(state["consumed_arms"][reboot["arm_id"]], self.clock.boot_id)
+        observations = result["prior_boot_observations"]
+        self.assertEqual(next(iter(observations.values()))["conclusion"], "REBOOT_RESCUED")
+        self.assertNotIn(rescue_boot, state["reconciled_boot_ids"])
+        self.assertTrue(self.module.boot()["repeated"])
+        self.assertEqual(self.module.ledger.load().state["budget"]["used"], 1)
+
     def test_prepared_crash_reservation_survives_unknown_and_exhausts(self):
         self.module.crash = CrashInjector("after_prepared")
         with self.assertRaises(SimulatedCrash):

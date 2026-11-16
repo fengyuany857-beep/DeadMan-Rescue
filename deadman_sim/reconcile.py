@@ -48,16 +48,18 @@ def reconcile(module, evidence=None):
             return dict(success=False, state=State.QUARANTINE.value, error="conflicting intents")
         key, intent = active[0] if active else (None, None)
         arm = intent["arm_id"] if intent else state["armed_arm_id"]
-        unknown_txs = [key for key, record in state["pending_txs"].items()
-                       if record["type"] != "BOOT"]
+        unknown_txs = list(state["pending_txs"])
+        prior_boots = {key: record["result"] for key, record in state["pending_txs"].items()
+                       if record["type"] == "BOOT"}
         conclusion = classify(intent["intent"] if intent else None, arm, evidence) if arm or intent else None
-        if unknown_txs and (not intent or intent["phase"] != "COMMITTED"):
+        if prior_boots or (unknown_txs and (not intent or intent["phase"] != "COMMITTED")):
             conclusion = ("OFF_OUTCOME_UNKNOWN" if intent and intent["intent"] == "off" else
                           "REBOOT_OUTCOME_UNKNOWN" if intent else "ABNORMAL_OUTCOME_UNKNOWN")
         observation = dict(evidence=asdict(evidence), observed_slot=slot, old_arm_id=arm,
                            prior_phase=intent["phase"] if intent else
                                {key: record["phase"] for key, record in state["pending_txs"].items()},
                            conclusion=conclusion, intent_id=key, unknown_txs=unknown_txs,
+                           prior_boot_observations=prior_boots,
                            state=State.RECONCILING.value,
                            control=dict(enabled=False, supervisor_permit=False, retry=False))
         base = dict(tx_id=str(uuid.uuid4()), type="BOOT", operation="reconcile",
