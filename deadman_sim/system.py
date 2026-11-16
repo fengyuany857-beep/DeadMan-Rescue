@@ -560,9 +560,10 @@ class Module:
                 if not self._known_own(slot, replace(loaded, status=LoadStatus.OK)):
                     return dict(success=False, error="unknown ownership")
                 control = dict(enabled=False, supervisor_permit=False)
-                # Retired identities must remain rejected across integrity recovery.
-                if "retired_boots" in loaded.state["control"]:
-                    control["retired_boots"] = loaded.state["control"]["retired_boots"]
+                # Integrity recovery preserves replay guards and explicit safety gates.
+                for key in ("retired_boots", "sensor_stand_down", "fault_latched"):
+                    if key in loaded.state["control"]:
+                        control[key] = loaded.state["control"][key]
                 state = dict(loaded.state, instance_generation=str(uuid.uuid4()),
                              state=State.STAND_DOWN.value, pending_txs={}, last_alarm=slot,
                              quarantined_transactions=dict(loaded.state["quarantined_transactions"],

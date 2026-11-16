@@ -212,6 +212,69 @@ class ReconcileTests(ModuleCase):
         self.assertIsNone(self.module.rtc.read_alarm())
         self.assertFalse(self.module.tick()["success"])
 
+    def test_sensor_stand_down_survives_trusted_recovery_without_restarting_observation(self):
+        self.arm()
+        self.sensors.battery = 19
+        self.assertFalse(self.module.tick()["success"])
+        self.assertIsNone(self.module.rtc.read_alarm())
+        self.assertTrue(self.module.ledger.load().state["control"]["sensor_stand_down"])
+        self.sensors.battery = 80
+        self.assertEqual(self.module.enable(), dict(success=False, error="stable observation required"))
+        self.assertTrue(self.module.boot()["success"])
+        self.module.boot_completed = True
+        self.module.rescuex_healthy = True
+        self.clock.advance(100)
+        self.assertEqual(self.module.enable(), dict(success=False, error="stable observation required"))
+        loaded = self.module.ledger.load()
+        budget = loaded.state["budget"]
+        self.assertEqual(budget["stable_since"], self.clock.monotonic())
+        self.assertEqual(budget["cooldown_since"], self.clock.monotonic())
+        self.clock.advance(600)
+        self.module.storage.atomic_write("state", canonical(dict(
+            seq=loaded.seq + 1, instance_generation=loaded.state["instance_generation"])))
+        self.assertEqual(self.module.ledger.load().status, LoadStatus.CACHE_AHEAD)
+        self.assertTrue(self.module.trusted_recover()["success"])
+        self.assertEqual(self.module.enable(), dict(success=False, error="stable observation required"))
+        recovered = self.module.ledger.load().state
+        self.assertEqual(recovered["control"]["sensor_stand_down"],
+                         loaded.state["control"]["sensor_stand_down"])
+        self.assertFalse(recovered["control"]["enabled"])
+        self.assertFalse(recovered["control"]["supervisor_permit"])
+        self.assertEqual(recovered["budget"], budget)
+        self.assertIsNone(self.module.rtc.read_alarm())
+        self.clock.advance(1199)
+        self.assertEqual(self.module.enable(), dict(success=False, error="stable observation required"))
+        self.clock.advance(1)
+        self.assertTrue(self.module.enable()["success"])
+        self.assertFalse(self.module.ledger.load().state["control"]["sensor_stand_down"])
+
+    def test_fault_latch_survives_trusted_recovery_until_explicit_repair(self):
+        self.arm()
+        self.module.rtc.fail_writes = 3
+        for expected in (1, 2, 3):
+            self.assertFalse(self.module.tick()["success"])
+            self.assertEqual(self.module.ledger.load().state["write_fail_count"], expected)
+        loaded = self.module.ledger.load()
+        self.assertEqual(self.module.state, State.FAULT)
+        self.assertTrue(loaded.state["control"]["fault_latched"])
+        self.assertFalse(self.module.enable()["success"])
+        self.assertIsNone(self.module.rtc.read_alarm())
+        self.module.storage.atomic_write("state", canonical(dict(
+            seq=loaded.seq + 1, instance_generation=loaded.state["instance_generation"])))
+        self.assertEqual(self.module.ledger.load().status, LoadStatus.CACHE_AHEAD)
+        self.assertTrue(self.module.trusted_recover()["success"])
+        self.assertEqual(self.module.enable(), dict(success=False, error="trusted fault repair required"))
+        recovered = self.module.ledger.load().state
+        self.assertEqual(recovered["control"]["fault_latched"], loaded.state["control"]["fault_latched"])
+        self.assertFalse(recovered["control"]["enabled"])
+        self.assertFalse(recovered["control"]["supervisor_permit"])
+        self.assertEqual(recovered["write_fail_count"], loaded.state["write_fail_count"])
+        self.assertFalse(self.module.runtime_fault)
+        self.assertIsNone(self.module.rtc.read_alarm())
+        self.assertTrue(self.module.repair_fault()["success"])
+        self.assertFalse(self.module.ledger.load().state["control"]["fault_latched"])
+        self.assertTrue(self.module.enable()["success"])
+
     def test_trusted_recovery_preserves_compressed_retired_boot_replay_guard(self):
         self.arm()
         boot_ids = []
