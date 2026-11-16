@@ -18,7 +18,7 @@ test_old_instance_intent_is_quarantined_without_consumption (test_sweeps.SweepTe
 test_storage_fault_with_unreadable_slot_reports_unknown (test_sweeps.SweepTests) ... ok
 
 ----------------------------------------------------------------------
-Ran 106 tests in 50.352s
+Ran 112 tests in 48.433s
 
 OK
 ```
@@ -76,6 +76,19 @@ OK
 
 扫描发现并修复了两个恢复边界：未提交 reboot 已清空槽时不能像正常续期一样进入自动重试，现保持持久 FAULT/待处理意图；重试待定但无 pending 事务时出现外部非空槽，重建后即 QUARANTINE。已锁存 FAULT 的普通恢复只重建缓存，不重新解释/触碰未完成硬件事务，仍需可信修复。持久化失败返回也新增槽值/是否为空/是否未知的如实观察字段。
 
+### PR #1 复审回归
+
+复审开始核对 HEAD 为 `ec6322299194046c597c0c5619433891acf5c4db`。以下四项均先写负例、运行得到失败，再修改实现；不是仅从可疑代码推断缺陷。
+
+| 假设 / 规格 | 复现测试 | 修复后的断言 |
+| --- | --- | --- |
+| 救援对账未消费又跨 boot，被普通重启证据退款（7.3 / 5.3） | `BudgetTests.test_interrupted_rescue_reconciliation_cannot_be_refunded_by_later_reboot` | 救援观察在清槽证据后崩溃，下一 boot 注入普通重启；原实现 used=0，现保守 UNKNOWN、used=1、reserved=0。保留旧 BOOT 观察，重清后一次消费并原子关闭旧 pending BOOT，重复对账不再扣额。 |
+| 不同 OS 进程夺取活实例续期许可（3） | `DaemonTests.test_separate_process_cannot_take_live_owner_but_can_recover_dead_owner` | 原实现子进程 recover 成功；现活所有者持有状态目录外的实例 flock，子进程 recover/tick 均失败且不改账。所有者关闭后子进程可接管；子进程不调用 Module.close 而退出后，内核释放 flock，后继仍可恢复续期。原事务锁及代次/持久 token 检查保留，不以 PID 判断存活。 |
+| 所有 RTC 对象关闭期间计数丢失（RTC 关机计数模型） | `RTCTests.test_counter_keeps_counting_when_no_rtc_object_exists`、`test_closed_rtc_preserves_counter_jumps_and_alarm_clear` | 原实现期望 4542 却读到 3982；现用共享 SimClock 的总 elapsed 与持久采样基点补算离线时间，跨 boot 和再次重建都不丢、不重复计算，保留跳变、空槽及到期目标。 |
+| 电量/温度恢复后可绕过稳定观察（7.3.6） | `BudgetTests.test_sensor_stand_down_needs_verified_stable_observation_before_resume`、`test_sensor_recovery_timer_restarts_on_failure_rebuild_and_boot`；`DaemonTests.test_sensors_stop_and_clear` | 原实现刚恢复健康的 enable 即成功；现持久传感器停用标志，enable/resume/重启改签均不可绕过。须本 boot 对账提交、boot_completed、可核实 RescueX 等健康门槛及连续 max(STABLE_RUN, COOLDOWN) 观察，1799 秒拒绝、1800 秒后显式 resume 才能新布防；健康失败、对象重建、boot 变化重新计时。预算复位后清本进程观察计时，不能把旧观察用于立即取消刚获准的新会话。 |
+
+稳定观察仍是离散采样模型；未调用观察入口时不能证明两个采样之间没有健康故障。上述所有 PASS 都不改变硬件待裁决状态，状态计数口径不变。
+
 ## 3. DESIGN 12.1 验证矩阵逐行对应
 
 | # / 原试验 | 对应主机测试类/方法 | 状态及未证明部分 |
@@ -94,7 +107,7 @@ OK
 | 12 响后残留与旧值回拨再入未来 | 无直接旧值回拨复响测试；`ScenarioTests.test_D_unregistered_disappearance` 只包含模型到期后清残 | not covered：可见 enabled、固件响后残留和再次触发均为「主机模拟不可证，待 T2/T3 裁决」；模型也未直接测试旧目标在回拨后重入未来的组合。 |
 | 13 外部槽覆盖/清除竞争 | `DaemonTests.test_foreign_slot_untouched`；`EngineTests.test_conflict_between_clear_and_write_is_not_overwritten`；`ReconcileTests.test_foreign_boot_slot_untouched`、`test_conflict_immediately_before_clear_not_overwritten` | partial：覆盖竞争和已知边界通过，未穷举外部清槽时序；厂商并发写槽和关机竞争为「主机模拟不可证，待 T2/T3 裁决」。 |
 | 14 清槽/fsync/关机命令失败 | `SweepTests.test_module_storage_faults_at_each_persist_phase`、`test_storage_fault_with_unreadable_slot_reports_unknown`；`StorageTests.test_faults_never_success`；`ShutdownTests.test_clear_failure_does_not_execute`；`ReoffTests.test_unknown_command_result_quarantined` | partial：主机部分 host-sim PASS，含 68 个阶段故障子例与槽未知报告；真实落盘、固件清槽、执行命令为「主机模拟不可证，待 T2/T3 裁决」，复关机结果另为「主机模拟不可证，待 T6 裁决」。 |
-| 15 救援预算/冷却/热与低电门槛 | `BudgetTests.test_prepared_crash_reservation_survives_unknown_and_exhausts`、`test_verified_normal_reboot_releases_reservation`、`test_stable_reset_requires_all_health_conditions`、`test_health_failure_and_process_rebuild_restart_timers`、`test_boot_change_gets_no_cooldown_credit`；`DaemonTests.test_sensors_stop_and_clear` | host-sim PASS：预扣、未知不退、稳定/冷却、计时重启、传感器缺失/阈值模型通过。实机传感器路径/单位及阈值安全性不在此 PASS 内，属「主机模拟不可证，待 T2/T3 裁决」。 |
+| 15 救援预算/冷却/热与低电门槛 | `BudgetTests.test_prepared_crash_reservation_survives_unknown_and_exhausts`、`test_verified_normal_reboot_releases_reservation`、`test_stable_reset_requires_all_health_conditions`、`test_health_failure_and_process_rebuild_restart_timers`、`test_boot_change_gets_no_cooldown_credit`、`test_interrupted_rescue_reconciliation_cannot_be_refunded_by_later_reboot`、`test_sensor_stand_down_needs_verified_stable_observation_before_resume`、`test_sensor_recovery_timer_restarts_on_failure_rebuild_and_boot`；`DaemonTests.test_sensors_stop_and_clear` | host-sim PASS：预扣、未知不退、稳定/冷却、计时重启、传感器缺失/阈值模型通过。实机传感器路径/单位及阈值安全性不在此 PASS 内，属「主机模拟不可证，待 T2/T3 裁决」。 |
 | 16 升级/禁用/卸载残留 | `DaemonTests.test_stop_generation_upgrade_blocks_old_instance`；`DisarmTests.test_disarm_complete_closing_records`、`test_uninstall_clears_before_deleting`、`test_forced_directory_delete_leaves_unowned_residue`、`test_disarm_does_not_bypass_fault_repair` | partial：模型收尾/停监督/强删残留通过，不是真实升级安装器或设备卸载；固件残留与人工收尾为「主机模拟不可证，待 T2/T3 裁决」。 |
 | 17 有界存储与 24h 续期 | `StorageBoundsTests.test_24h_renewals_compact_with_bounded_peak_and_rebuild`、`test_uncompressible_storage_stands_down_without_drop`、`test_renewals_do_not_reparse_unchanged_verified_tail`；`LedgerTests.test_head_switch_crashes_recover_only_selected_generation`、`test_quota_compaction_does_not_drop_evidence` | partial：24h 模拟续期与限额通过；真实 24h 耗时/写失败统计、闪存寿命/耗电/槽独占为「主机模拟不可证，待 T2/T3 裁决」。 |
 | 18 RescueX/bootmod 共存 | `BudgetTests.test_stable_reset_requires_all_health_conditions`；`DaemonTests.test_write_fail_max_and_supervisor`；`ShutdownTests.test_maintenance_never_resigns` | partial：只有注入健康状态与监督退避，不含真实 RescueX/bootmod 动作或写集离线审阅；共存、健康接口和停用边界为「主机模拟不可证，待 T2/T3 裁决」。 |
@@ -110,7 +123,7 @@ OK
 | 4 RTC 前跳/回拨停用、外部占用冲突 | `DaemonTests.test_rtc_jumps_quarantine`、`test_foreign_slot_untouched` | host-sim PASS。 |
 | 5 预算预扣/耗尽/稳定冷却/未知不退 | `BudgetTests.test_prepared_crash_reservation_survives_unknown_and_exhausts`、`test_stable_reset_requires_all_health_conditions`、`test_boot_change_gets_no_cooldown_credit` | host-sim PASS。 |
 | 6 ENOSPC 不假成功、不新增武装 | `EngineTests.test_prepare_and_commit_storage_failure`、`test_commit_failure_reports_uncertain_hardware`；`ReconcileTests.test_enospc_observation_never_clears_or_succeeds`、`test_enospc_consumption_preserves_pending_and_reservation` | host-sim PASS：提交失败可能留下已经写入、未提交的槽；报告不成功并保留待办，不声称绝无残留。 |
-| 7 双实例锁互斥、后到不续期 | `LockTests.test_same_process_exclusion`；`DaemonTests.test_lock_loser_and_unpermitted_instance` | host-sim PASS：同宿主的两个对象；不是跨设备或真实多进程压力证明。 |
+| 7 双实例锁互斥、后到不续期 | `LockTests.test_same_process_exclusion`；`DaemonTests.test_lock_loser_and_unpermitted_instance`、`test_separate_process_cannot_take_live_owner_but_can_recover_dead_owner` | host-sim PASS：含同宿主实际子进程争用、活所有者拒绝接管、退出后恢复；不是跨设备或多进程压力证明。 |
 | 8 disarm 完整收尾、强删残留 | `DisarmTests.test_disarm_complete_closing_records`、`test_forced_directory_delete_leaves_unowned_residue` | host-sim PASS。 |
 | 9 A–E 端到端 | `ScenarioTests.test_A_normal_reboot`、`test_B_reboot_falls_into_charging_layer`、`test_C_intentional_off_then_manual_boot`、`test_D_unregistered_disappearance`、`test_E_failed_off_unknown_keeps_system_on`；另有 `test_F_cancel_requires_explicit_resume` | host-sim PASS：只指模型流程；所有设备因果推断仍须 T2/T3。 |
 
@@ -124,7 +137,7 @@ OK
 | 写成功、验证或 COMMITTED 前 | `EngineTests.test_crash_boundaries_recover_without_blind_actions`（after_write / after_armed_verified）；`test_recovery_untrusted_written_value_cleans_only_own`、`test_recovery_refuses_unexplained_foreign_value`；`ReconcileTests.test_cross_boot_uncommitted_reboot_is_unknown_and_cleared` | host-sim PASS：可信匹配补提交、异常停用、跨 boot 不当成功心跳。 |
 | 布防 COMMITTED、缓存更新前 | `EngineTests.test_crash_boundaries_recover_without_blind_actions`（after_commit）；`ReconcileTests.test_abnormal_boot_idempotent_and_no_second_charge` | host-sim PASS：权威链恢复，不重放动作。 |
 | off 禁止续期后、清槽/读回失败 | `EngineTests.test_off_crash_after_stop_never_executes`；`ShutdownTests.test_clear_failure_does_not_execute`；`ScenarioTests.test_E_failed_off_unknown_keeps_system_on` | host-sim PASS：失败不关机、不声称清除，故障/残留可见。 |
-| 清槽验证后、消费提交前 | `ReconcileTests.test_crash_each_boot_boundary`（boot_after_clear_evidence / boot_before_consumption，含 recover 入口）；`test_enospc_consumption_preserves_pending_and_reservation` | host-sim PASS：保留原 arm_id，重读/清槽，一次消费。 |
+| 清槽验证后、消费提交前 | `ReconcileTests.test_crash_each_boot_boundary`（boot_after_clear_evidence / boot_before_consumption，含 recover 入口）；`test_enospc_consumption_preserves_pending_and_reservation`；`BudgetTests.test_interrupted_rescue_reconciliation_cannot_be_refunded_by_later_reboot` | host-sim PASS：保留原 arm_id，重读/清槽，一次消费；跨到下一 boot 也不丢救援观察或退款，不残留旧 pending BOOT。 |
 | 消费 COMMITTED、BOOT 缓存前 | `ReconcileTests.test_crash_each_boot_boundary`（boot_after_consumption / boot_after_cache）；`test_abnormal_boot_idempotent_and_no_second_charge` | host-sim PASS：仅恢复结论/缓存，不重复扣额或自动发动作。 |
 | REOFF 请求持久化后、命令前/后失联 | `SweepTests.test_every_defined_crash_point_per_reachable_entry`（全部 reoff_*，含 reoff_after_action）；`ReoffTests.test_crash_after_attempt_never_reissues`、`test_unknown_command_result_quarantined` | host-sim PASS：请求后、动作前/后均崩溃重建，同/跨 boot 不二次发原动作。真实失联/复关机为「主机模拟不可证，待 T6 裁决」。 |
 | 快照或 HEAD 切换中 | `LedgerTests.test_head_switch_crashes_recover_only_selected_generation`、`test_head_rename_crashes`；`ReconcileTests.test_integrity_recovery_crash_does_not_remove_rollback_gate` | host-sim PASS：仅选有效 HEAD，新旧代次/回滚门控保留；不代表物理掉电持久性。 |
@@ -158,12 +171,13 @@ OK
 - `Evidence.mapping_verified=False` 是默认；不从字符串或墙钟推定可信映射。`trusted_timebase` 默认 False、`rtc_fired_before` 默认 None，证据不足走 UNKNOWN。普通非 RTC 结果不强制空值必须命名 arm；显式命名错误仍是冲突。
 - `reoff_enabled` 默认 False；显式开启只用于模型协议测试，不表示通过 T6。命令结果由 `reoff_command_result` 注入。
 - `rescuex_healthy` 默认 None，无法核实就不复位预算；可注入 bool 或 callable。必须同时有本 boot 对账提交、boot_completed、守护健康、安全传感器、无失败/冲突和本 boot 连续稳定/冷却观察。
+- 传感器不合格停用后，单次合格采样和显式 resume 均不能解除持久恢复门槛；同样需要上述完整稳定观察。默认 RescueX 状态不可核实时继续停用，而非猜测恢复。
 - RTC、传感器、bootreason、RescueX 离线契约和固件解除效果尚未定版；主机不得替实机背书。复位或可信修复后仍需显式 enable/resume，不自动重建保护。
 
 ### 明确的覆盖缺口
 
 1. 已扫描所有定义的断点模板在列出入口的可达路径，含维护 PREPARED、REOFF 动作后崩溃和七类完整性错误+外部槽组合。仍不是所有机器指令间隙、同一模板每次重复调用、所有文件名、任意深度连续崩溃、全部状态/传感器/人工介入/并发时序的全排列证明。新增命名断点必须通过 AST 收集和命中检查，不能靠手工遗漏保持绿色。
-2. `flock` 在本 Linux 宿主使用真实文件锁，但测试主要是同进程不同文件描述符/Module 对象，另有弱引用所有者登记；没有跨宿主锁、分布式文件系统或真实多进程争用压力测试。不能推出安卓监督器必然互斥。
+2. `flock` 在本 Linux 宿主使用真实文件锁；事务锁外另有长持有实例 flock，测试含不同 OS 进程的活所有者拒绝接管及退出后接管。没有跨宿主锁、分布式文件系统或多进程争用压力测试，不能推出安卓监督器必然互斥。
 3. 实现调用主机 fsync/rename，错误通过注入模拟；崩溃是异常后重建对象，不清除内核页缓存，不等于 SIGKILL、突然断电、闪存控制器落盘或 Android 文件系统耐久性证明。
 4. RTC 是文件背书计数器，独立于 Unix 纪元，但没有真实 enabled 状态、PMIC、充电层、固件重写或唤醒硬件。到期属性不代表真实成功开机；旧值回拨再响和响后残留未做设备验证。
 5. bootreason 和可信时间/关联关系由 Evidence 注入，不是采集或标定结果。尤其 REOFF 测试可直接注入 off 后 RTC 原因，不证明真实 off 清槽后仍能产生该证据链。没有验证厂商菜单、trap 可写窗口/延迟、系统时间与 RTC 的联动。
