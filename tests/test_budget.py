@@ -4,6 +4,56 @@ from support import ModuleCase
 
 
 class BudgetTests(ModuleCase):
+    def test_sensor_stand_down_needs_verified_stable_observation_before_resume(self):
+        self.arm()
+        self.sensors.battery = 19
+        self.assertFalse(self.module.tick()["success"])
+        self.assertIsNone(self.module.rtc.read_alarm())
+        self.sensors.battery = 80
+        self.assertFalse(self.module.enable()["success"])
+        self.assertFalse(self.module.request_reboot()["success"])
+        self.module.boot_completed = True
+        self.module.rescuex_healthy = True
+        self.assertFalse(self.module.resume()["success"])
+        self.assertTrue(self.module.boot()["success"])
+        self.assertFalse(self.module.resume()["success"])
+        self.clock.advance(1799)
+        self.assertFalse(self.module.resume()["success"])
+        self.clock.advance(1)
+        self.assertTrue(self.module.resume()["success"])
+        self.arm()
+
+    def test_sensor_recovery_timer_restarts_on_failure_rebuild_and_boot(self):
+        self.arm()
+        self.sensors.temp = 45
+        self.module.tick()
+        self.sensors.temp = 25
+        self.module.boot()
+        self.module.boot_completed = True
+        self.module.rescuex_healthy = True
+        self.module.observe_health()
+        self.clock.advance(1799)
+        self.sensors.temp = None
+        self.assertFalse(self.module.resume()["success"])
+        self.sensors.temp = 25
+        self.assertFalse(self.module.resume()["success"])
+        self.clock.advance(1799)
+        self.module.close()
+        self.module = self.make_module()
+        self.module.boot_completed = True
+        self.module.rescuex_healthy = True
+        self.assertFalse(self.module.resume()["success"])
+        self.clock.advance(1799)
+        self.new_boot()
+        self.module.boot_completed = True
+        self.module.rescuex_healthy = True
+        self.assertFalse(self.module.resume()["success"])
+        self.clock.advance(1799)
+        self.assertFalse(self.module.resume()["success"])
+        self.clock.advance(1)
+        self.assertTrue(self.module.resume()["success"])
+        self.arm()
+
     def test_interrupted_rescue_reconciliation_cannot_be_refunded_by_later_reboot(self):
         self.arm()
         reboot = self.module.request_reboot()

@@ -119,6 +119,12 @@ print(json.dumps(dict(recover=module.recover(), tick=module.tick())))
                 self.assertIsNone(self.module.rtc.read_alarm())
                 self.assertFalse(self.module.enable()["success"])
                 self.sensors.battery, self.sensors.temp = 80, 25
+                self.assertFalse(self.module.enable()["success"])
+                self.module.boot()
+                self.module.boot_completed = True
+                self.module.rescuex_healthy = True
+                self.module.observe_health()
+                self.clock.advance(1800)
                 self.assertTrue(self.module.enable()["success"])
 
     def test_lock_loser_and_unpermitted_instance(self):

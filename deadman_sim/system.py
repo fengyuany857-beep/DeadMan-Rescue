@@ -193,10 +193,13 @@ class Module:
             expected.extend([result.get("target_alarm"), result.get("old_alarm")])
         return slot in expected
 
-    def _stop(self, state=State.STAND_DOWN, reason="stopped"):
+    def _stop(self, state=State.STAND_DOWN, reason="stopped", *, sensor_failure=False):
         current = self.ledger.load().state
         self._release_owner()
         control = dict(enabled=False, supervisor_permit=False, retry=False)
+        if sensor_failure:
+            self._healthy_since = None
+            control["sensor_stand_down"] = True
         if state in (State.FAULT, State.QUARANTINE):
             control["fault_latched"] = True
         return self._record(state=state, operation="stop", error=reason,
@@ -357,7 +360,13 @@ class Module:
                    for key, item in state["intents"].items()):
                 return dict(success=False, error="unresolved intent")
             if not self.sensors.healthy():
+                self._stop(reason="unsafe sensors", sensor_failure=True)
                 return dict(success=False, error="unsafe sensors")
+            if state["control"].get("sensor_stand_down"):
+                self._observe_health_locked()
+                state = self.ledger.load().state
+                if state["control"].get("sensor_stand_down"):
+                    return dict(success=False, error="stable observation required")
             if self.read_slot() is not None:
                 self._stop(State.QUARANTINE, "occupied on enable")
                 return dict(success=False, error="occupied slot")
@@ -386,7 +395,7 @@ class Module:
                 return dict(success=False, error=loaded.status.value)
             state, control = loaded.state, loaded.state["control"]
             if (not control.get("enabled") or control.get("owner") != self.token or
-                    not control.get("supervisor_permit") or
+                    not control.get("supervisor_permit") or control.get("sensor_stand_down") or
                     state["stop_generation"] != getattr(self, "expected_stop", None) or
                     self.boot_id != control.get("boot_id")):
                 self._release_owner()
@@ -397,7 +406,7 @@ class Module:
                                       State.ARM_PENDING.value):
                 return dict(success=False, skipped=True, error="state prohibits renewal")
             if not self.sensors.healthy():
-                self._stop(reason="unsafe sensors")
+                self._stop(reason="unsafe sensors", sensor_failure=True)
                 cleanup = self._clear_owned(final_state=State.STAND_DOWN)
                 return dict(success=False, stopped=True, error="unsafe sensors", cleanup=cleanup)
             slot = self.read_slot()
@@ -452,8 +461,12 @@ class Module:
             budget = fresh_budget()
             budget.update(stable_boot_id=self.boot_id, stable_since=now, cooldown_since=now)
             self._record(operation="budget_reset", budget=budget, state=State.DISARMED,
-                         control=dict(enabled=False, supervisor_permit=False))
+                         control=dict(enabled=False, supervisor_permit=False, sensor_stand_down=False))
+            self._healthy_since = None
             return dict(success=True, reset=True)
+        if state["control"].get("sensor_stand_down"):
+            self._record(operation="sensor_recovery", control=dict(sensor_stand_down=False))
+            self._healthy_since = None
         return dict(success=True, reset=False)
 
     def observe_health(self):
@@ -575,7 +588,8 @@ class Module:
         state = self.ledger.load().state
         if kind == "reboot" and (state["state"] in (
                 State.FAULT.value, State.QUARANTINE.value, State.UNKNOWN.value,
-                State.RECONCILING.value) or not self.sensors.healthy()):
+                State.RECONCILING.value) or state["control"].get("sensor_stand_down") or
+                not self.sensors.healthy()):
             return dict(success=False, error="reboot arming prohibited")
         superseded = []
         for key, item in state["intents"].items():
