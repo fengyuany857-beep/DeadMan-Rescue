@@ -2,7 +2,7 @@ import tempfile
 
 from deadman_sim.classify import Evidence
 from deadman_sim.crash import CrashInjector, SimulatedCrash
-from deadman_sim.ledger import State, canonical
+from deadman_sim.ledger import HISTORY_LIMIT, LoadStatus, State, canonical, retired_boot
 from deadman_sim.clock import SimClock
 from deadman_sim.system import Module
 from support import ModuleCase
@@ -211,3 +211,70 @@ class ReconcileTests(ModuleCase):
         self.assertEqual(state["quarantined_transactions"], pending)
         self.assertIsNone(self.module.rtc.read_alarm())
         self.assertFalse(self.module.tick()["success"])
+
+    def test_trusted_recovery_preserves_compressed_retired_boot_replay_guard(self):
+        self.arm()
+        boot_ids = []
+        for _ in range(70):
+            self.assertTrue(self.new_boot()["success"])
+            boot_ids.append(self.clock.boot_id)
+        with self.module.lock:
+            # compact() runs compress_completed() and persists its tombstones.
+            self.module.ledger.compact()
+        loaded = self.module.ledger.load()
+        state = loaded.state
+        self.assertEqual(state["pending_txs"], {})
+        self.assertEqual(state["reconciled_boot_ids"], boot_ids[-HISTORY_LIMIT:])
+        self.assertNotIn(boot_ids[0], state["boots"])
+        self.assertTrue(retired_boot(state, boot_ids[0]))
+        tombstones = state["control"]["retired_boots"]
+        generation = state["instance_generation"]
+        self.module.storage.atomic_write("state", canonical(dict(
+            seq=loaded.seq + 1, instance_generation=generation)))
+        self.assertEqual(self.module.ledger.load().status, LoadStatus.CACHE_AHEAD)
+        self.assertFalse(self.module.boot()["success"])
+        self.assertTrue(self.module.trusted_recover()["success"])
+        recovered = self.module.ledger.load()
+        self.assertNotEqual(recovered.state["instance_generation"], generation)
+        self.assertFalse(recovered.state["control"]["enabled"])
+        self.assertFalse(recovered.state["control"]["supervisor_permit"])
+
+        self.module.close()
+        self.clock.boot_id = boot_ids[0]
+        self.module = self.make_module()
+        before = self.module.ledger.load()
+        result = self.module.boot()
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "retired/ambiguous boot identity")
+        after = self.module.ledger.load()
+        self.assertEqual(after.seq, before.seq)
+        self.assertEqual(after.records, before.records)
+        self.assertEqual(after.state, before.state)
+        self.assertEqual(after.state["budget"], before.state["budget"])
+        self.assertEqual(after.state["consumed_arms"], before.state["consumed_arms"])
+        self.assertEqual(after.state["control"]["retired_boots"], tombstones)
+        self.assertTrue(retired_boot(after.state, boot_ids[0]))
+        self.assertEqual(self.module.executed_actions, [])
+
+        for boot_id in boot_ids[-HISTORY_LIMIT:]:
+            with self.subTest(recent_boot=boot_id):
+                self.module.close()
+                self.clock.boot_id = boot_id
+                self.module = self.make_module()
+                result = self.module.boot()
+                self.assertTrue(result["success"])
+                self.assertTrue(result["repeated"])
+                self.assertEqual(result["conclusion"], before.state["boots"][boot_id]["conclusion"])
+                self.assertEqual(self.module.ledger.load().seq, before.seq)
+                self.assertEqual(self.module.ledger.load().state, before.state)
+
+        result = self.new_boot()
+        self.assertNotIn(self.clock.boot_id, boot_ids)
+        self.assertTrue(result["success"])
+        self.assertFalse(result.get("repeated", False))
+        accepted = self.module.ledger.load()
+        self.assertGreater(accepted.seq, before.seq)
+        self.assertIn(self.clock.boot_id, accepted.state["reconciled_boot_ids"])
+        self.assertTrue(any(record["type"] == "BOOT" and record["phase"] == "COMMITTED" and
+                            record["source_boot_id"] == self.clock.boot_id
+                            for record in accepted.records))

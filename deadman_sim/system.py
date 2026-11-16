@@ -559,11 +559,15 @@ class Module:
             else:
                 if not self._known_own(slot, replace(loaded, status=LoadStatus.OK)):
                     return dict(success=False, error="unknown ownership")
+                control = dict(enabled=False, supervisor_permit=False)
+                # Retired identities must remain rejected across integrity recovery.
+                if "retired_boots" in loaded.state["control"]:
+                    control["retired_boots"] = loaded.state["control"]["retired_boots"]
                 state = dict(loaded.state, instance_generation=str(uuid.uuid4()),
                              state=State.STAND_DOWN.value, pending_txs={}, last_alarm=slot,
                              quarantined_transactions=dict(loaded.state["quarantined_transactions"],
                                                            **loaded.state["pending_txs"]),
-                             control=dict(enabled=False, supervisor_permit=False),
+                             control=control,
                              quarantined_intents=dict(loaded.state["quarantined_intents"], **{
                                  key: "old instance generation" for key in loaded.state["intents"]}))
             if self.storage.path("state").exists():
