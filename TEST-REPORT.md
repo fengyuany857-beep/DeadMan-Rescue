@@ -18,7 +18,7 @@ test_old_instance_intent_is_quarantined_without_consumption (test_sweeps.SweepTe
 test_storage_fault_with_unreadable_slot_reports_unknown (test_sweeps.SweepTests) ... ok
 
 ----------------------------------------------------------------------
-Ran 112 tests in 48.433s
+Ran 113 tests in 48.972s
 
 OK
 ```
@@ -88,6 +88,8 @@ OK
 | 电量/温度恢复后可绕过稳定观察（7.3.6） | `BudgetTests.test_sensor_stand_down_needs_verified_stable_observation_before_resume`、`test_sensor_recovery_timer_restarts_on_failure_rebuild_and_boot`；`DaemonTests.test_sensors_stop_and_clear` | 原实现刚恢复健康的 enable 即成功；现持久传感器停用标志，enable/resume/重启改签均不可绕过。须本 boot 对账提交、boot_completed、可核实 RescueX 等健康门槛及连续 max(STABLE_RUN, COOLDOWN) 观察，1799 秒拒绝、1800 秒后显式 resume 才能新布防；健康失败、对象重建、boot 变化重新计时。预算复位后清本进程观察计时，不能把旧观察用于立即取消刚获准的新会话。 |
 
 稳定观察仍是离散采样模型；未调用观察入口时不能证明两个采样之间没有健康故障。上述所有 PASS 都不改变硬件待裁决状态，状态计数口径不变。
+
+后续复审核对起点为 `92a5953`。`DaemonTests.test_non_claiming_helpers_do_not_block_replacement_daemon` 先复现：原守护关闭后，仍存活的 helper 调用 observe_health 或非 claiming 恢复，会持有实例锁而不修改 owner token，使替代守护 recover 失败。独立清理每个子例后，直接读取 state 的对照分支未复现此问题。修复将恢复入口的实例锁检查限定为显式 claim；非 claiming helper 只在调用期间持有事务锁，不打开实例锁。回归验证 helper 保持存活时替代守护仍可认领、推进模拟时间并续期到 +600，helper 不改 owner token；先前的实际子进程活所有者拒绝接管测试也保留。
 
 ## 3. DESIGN 12.1 验证矩阵逐行对应
 
