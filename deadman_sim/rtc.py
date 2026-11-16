@@ -16,10 +16,9 @@ class SimRTC:
         self.clear_no_effect = False
         self.unreadable = False
         if not self.storage.path("rtc.json").exists():
-            self._save({"counter": 3942, "alarm": None, "owner": None})
-        state = self._load()
-        state["clock_elapsed"] = clock.elapsed
-        self._save(state)
+            self._save({"counter": 3942, "alarm": None, "owner": None,
+                        "clock_elapsed": clock.elapsed})
+        self._advance(0)
         clock.subscribe(self._advance)
 
     def close(self):

@@ -14,7 +14,7 @@ class RTCTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.clock = SimClock(wall=10000000)
         self.rtc = SimRTC(Path(self.tmp.name) / "hardware", self.clock)
-        self.addCleanup(self.rtc.close)
+        self.addCleanup(lambda: self.rtc.close())
 
     def test_counter_reboot_rebuild_and_state_deletion(self):
         state = Path(self.tmp.name) / "state"
@@ -32,6 +32,35 @@ class RTCTests(unittest.TestCase):
         self.assertEqual(rebuilt.read_counter(), 4542)
         self.assertTrue(rebuilt.fired)
         self.assertEqual(rebuilt.read_alarm(), 4542)
+
+    def test_counter_keeps_counting_when_no_rtc_object_exists(self):
+        self.rtc.write("+600")
+        self.clock.advance(40)
+        self.rtc.close()
+        self.clock.advance(560)
+        self.clock.new_boot()
+        rebuilt = SimRTC(Path(self.tmp.name) / "hardware", self.clock)
+        self.rtc = rebuilt
+        self.assertEqual(rebuilt.read_counter(), 4542)
+        self.assertTrue(rebuilt.fired)
+        self.assertEqual(rebuilt.read_alarm(), 4542)
+        rebuilt.close()
+        self.clock.advance(100)
+        again = SimRTC(Path(self.tmp.name) / "hardware", self.clock)
+        self.rtc = again
+        self.assertEqual(again.read_counter(), 4642)
+        self.assertTrue(again.fired)
+
+    def test_closed_rtc_preserves_counter_jumps_and_alarm_clear(self):
+        self.rtc.jump(-100)
+        self.rtc.write("0")
+        self.rtc.close()
+        self.clock.advance(200)
+        rebuilt = SimRTC(Path(self.tmp.name) / "hardware", self.clock)
+        self.rtc = rebuilt
+        self.assertEqual(rebuilt.read_counter(), 4042)
+        self.assertIsNone(rebuilt.read_alarm())
+        self.assertFalse(rebuilt.fired)
 
     def test_faults_and_relative_only(self):
         for invalid in ("1234", "+0", "-1", "+1\n", "garbage", ""):
