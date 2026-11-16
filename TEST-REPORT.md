@@ -18,7 +18,7 @@ test_old_instance_intent_is_quarantined_without_consumption (test_sweeps.SweepTe
 test_storage_fault_with_unreadable_slot_reports_unknown (test_sweeps.SweepTests) ... ok
 
 ----------------------------------------------------------------------
-Ran 113 tests in 48.972s
+Ran 123 tests in 56.905s
 
 OK
 ```
@@ -60,6 +60,7 @@ OK
 | ClassifyTests | `tests/test_classify.py` |
 | BudgetTests | `tests/test_budget.py` |
 | ReoffTests | `tests/test_reoff.py` |
+| ReviewRegressions | `tests/test_review_regressions.py` |
 | StorageBoundsTests | `tests/test_storage_bounds.py` |
 | ScenarioTests | `tests/test_scenarios.py` |
 | SweepTests | `tests/test_sweeps.py` |
@@ -191,3 +192,21 @@ OK
 ## 8. 交付检查
 
 `.gitignore` 排除 `__pycache__/` 和 Python 字节码。交付只包含 `deadman_sim/`、`tests/`、本报告和 `.gitignore`；`docs/` 不改。提交前核对 `git diff --stat main -- docs` 输出为空。无第三方依赖，无 Android/真机实现，本报告不改变 DESIGN 原有真机待验证结论。
+
+
+## 9. 独立检查六项发现复测与修复（2026-11-16）
+
+复测基线为 `1c613f2`；为避免遗留修改混入基线，使用内存 import loader 从 `git show HEAD:<path>` 加载实现，未覆盖工作区文件。原 `scratch/probes.py` 的六个探针全部复跑，子进程同样使用基线代码。随后对工作区再次全部复跑。N1 另以持久化外来 boot 候选直接进入执行阶段验证。
+
+| 发现 | 基线实测 | 处置及新增回归（均为 ReviewRegressions） |
+| --- | --- | --- |
+| B1 | 仍复现：renew COMMITTED 的 fsync 抛错后，新对象 recover=ARMED，tick 成功；PREPARED 对照停在 FAULT | 存储变更前先同步 IO-UNCERTAIN 围栏，失败保留；所有普通入口先检查，禁止恢复武装，仅清自有槽，可信修复成功才解除。`test_b1_each_append_phase_fsync_failure_survives_rebuild` 覆盖四阶段；`test_b1_each_atomic_file_and_error_survives_rebuild` 覆盖 snapshot/tail/HEAD/cache × fsync/rename/目录同步；`test_b1_failed_fault_record_cannot_erase_write_ahead_fence` 覆盖连续故障；`test_b1_fence_removal_sync_failure_survives_rebuild` 覆盖围栏移除同步失败。每例验证同/跨 boot 重建与显式修复。 |
+| M1 | 已被 `9b61c8c` 等修复：真实后到进程 recover/tick 均失败，原所有者 tick 成功 | 沿用实例 flock。`test_m1_real_process_death_releases_instance_ownership` 额外以 SIGKILL 杀子进程，验证拒绝活实例接管及死实例可恢复。 |
+| M2 | 仍复现：before_prepared 崩溃后恢复 STAND_DOWN、槽 4542、无 pending | 首笔停止提交保存 cleanup_pending 与旧 arm/槽依据；无清理事务的恢复先幂等清残，失败进入 FAULT；清理提交解除待办。`test_m2_stop_before_prepared_recovers_cleanup_without_commands` 覆盖 off/reboot/disarm/uninstall/maintenance，各含清槽失败。 |
+| M3 | 已被 `bf56b99` 修复：零秒 resume 被 stable observation required 拒绝 | 沿用实现。`test_m3_each_sensor_recovery_rejection` 覆盖 1799 秒、健康中断、跨 boot、对象重建四种拒绝与重新满期后许可。 |
+| M4 | 仍复现：13000 条已完成 arm 历史使快照报 unfinished evidence 超限 | 快照压缩完成历史至最近 64 条及仍被未完成证据引用项，保存 completed_through_seq、预算、待办和隔离依据；已退休 boot 以固定 65536 位 Bloom 墓碑拒绝重放。`test_m4_completed_history_pressure_is_bounded_and_retired_boot_cannot_replay` 三轮等价 39000 次续期/900 boot 压力，验证快照小于 100000 字节、波动小于 2000 字节及证据不丢；`test_m4_tail_append_after_compaction_does_not_restore_pruned_history` 验证轮转后追加不会恢复旧历史。 |
+| N1 | 原校验有效，属于覆盖缺口 | `test_n1_persisted_foreign_boot_reoff_candidate_rejected_at_execution` 将外来 boot 候选落盘后重建，直接进入执行阶段，断言 seq/尝试/动作均不增加。内存移除此 boot 校验后，本测试实际失败，确认能抓住原存活变异；生产代码未保留变异。 |
+
+首轮审查遗留修改的完整测试：122 tests / 65.223s / OK。最终全套结果见第 1 节（增加围栏移除失败回归后共 123 项）。不修改旧断言、默认参数或 docs/，只使用标准库。
+
+历史压缩只对已完成证据生效；未完成/隔离证据仍可能超过限额并保守失败。Bloom 无假阴性，碰撞或长期饱和可能拒绝新的 boot（可用性取舍，不能以误判授权重放）；不承诺无限 boot 可用。这里的长期稳态是等价压力构造，不是数日/长年运行。围栏协议基于主机文件系统成功 fsync 的假设，不能证明物理断电耐久性。M1 的 SIGKILL 仅验证宿主实例 flock 释放，不提升 RTC/Android/闪存证明等级。原 T2/T3/T6、诊断档案、真实 I/O 时延及设备边界维持不变。

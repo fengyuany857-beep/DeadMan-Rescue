@@ -28,6 +28,7 @@ class Module:
         if type(self.tolerance) not in (int, float) or not math.isfinite(self.tolerance) or self.tolerance < 0:
             raise ValueError("negative tolerance")
         self.storage = Storage(self.root / "deadman-rescue")
+        self.storage.guard_enabled = True
         self.lock = SharedLock(self.root)
         self.ledger = Ledger(self.storage, self.lock, self.crash)
         self.rtc = SimRTC(hardware_dir, clock)
@@ -110,6 +111,9 @@ class Module:
             return dict(success=False, error="runtime FAULT")
         try:
             with self.lock:
+                if (not allow_runtime_fault and self.storage.root.exists() and
+                        self.storage.path("IO-UNCERTAIN").exists()):
+                    return self._uncertain_recovery()
                 if recover and not self._recovered:
                     result = self._recover_locked()
                     if self.ledger.load().status != LoadStatus.OK:
@@ -142,6 +146,24 @@ class Module:
                             slot=None, slot_empty=None)
             return dict(success=False, error=str(exc), slot_unknown=False,
                         slot=slot, slot_empty=slot is None)
+
+    def _uncertain_recovery(self):
+        loaded = self.ledger.load()
+        slot = self.read_slot()
+        if loaded.status != LoadStatus.OK:
+            return dict(success=False, error="uncertain persistence", slot=slot)
+        # Do not resume/complete an interrupted arm based on merely readable data.
+        cross_boot = loaded.state["last_samples"].get("boot_id") != self.boot_id
+        final = (State.STAND_DOWN if cross_boot or loaded.state["control"].get(
+            "persistence_gate_state") == State.STAND_DOWN.value else State.FAULT)
+        self._stop(final, "uncertain persistence")
+        self._record(operation="persistence_gate", control=dict(fault_latched=True,
+                                                                   persistence_gate_state=final.value))
+        if self._known_own(slot):
+            cleanup = self._clear_owned(final_state=final)
+        else:
+            cleanup = dict(success=False, error="unknown ownership", slot=slot)
+        return dict(success=False, error="explicit persistence repair required", cleanup=cleanup)
 
     def _record(self, *, state=None, control=None, **values):
         loaded = self.ledger.load()
@@ -196,7 +218,10 @@ class Module:
     def _stop(self, state=State.STAND_DOWN, reason="stopped", *, sensor_failure=False):
         current = self.ledger.load().state
         self._release_owner()
-        control = dict(enabled=False, supervisor_permit=False, retry=False)
+        control = dict(enabled=False, supervisor_permit=False, retry=False,
+                       cleanup_pending=dict(reason=reason, boot_id=self.boot_id,
+                                            arm_id=current["armed_arm_id"],
+                                            old_alarm=current["last_alarm"]))
         if sensor_failure:
             self._healthy_since = None
             control["sensor_stand_down"] = True
@@ -216,6 +241,7 @@ class Module:
             for key in list(self.ledger.load().state["pending_txs"]):
                 self._record(operation="abort", state=final_state,
                              result=dict(abort_tx=key))
+            self._record(operation="cleanup_complete", control=dict(cleanup_pending=False))
             return result
         except HardwareFailure as exc:
             return self._failed(tx, exc, recoverable=False)
@@ -261,6 +287,15 @@ class Module:
         if (claim and state["control"].get("enabled") and state["control"].get("boot_id") == self.boot_id and
                 not self._can_claim()):
             return dict(success=False, skipped=True, error="live daemon owner")
+        if state["control"].get("cleanup_pending") and not state["pending_txs"]:
+            final = State(state["state"])
+            result = self._clear_owned(final_state=final)
+            if not result["success"]:
+                self._stop(State.FAULT, "stop cleanup failed")
+                return result
+            loaded = self.ledger.load()
+            state = loaded.state
+            slot = self.read_slot()
         if state["state"] == State.FAULT.value and state["control"].get("fault_latched"):
             self.ledger.write_cache()
             return dict(success=True, state=State.FAULT.value, slot=slot)
@@ -544,6 +579,7 @@ class Module:
             result = self._clear_owned(operation="disarm", final_state=State.DISARMED)
             if not result["success"]:
                 return result
+            self.storage.clear_uncertainty()
             self.runtime_fault = False
             self._recovered = True
             return dict(success=True, instance_generation=state["instance_generation"])
@@ -580,6 +616,7 @@ class Module:
             result = self._clear_owned(operation="disarm", final_state=State.DISARMED)
             if result["success"]:
                 self._record(operation="repair", control=dict(fault_latched=False))
+                self.storage.clear_uncertainty()
                 self.runtime_fault = False
             return result
         return self._entry(repair, recover=False, allow_runtime_fault=True)

@@ -180,6 +180,73 @@ def reduce_record(state, record):
     return state
 
 
+# Completed records are diagnostic history, not permission to replay commands.
+# A fixed-size Bloom tombstone set has no false negatives; collisions fail closed.
+# It covers retired boot UUIDs whose full results have left the recent window.
+HISTORY_LIMIT = 64
+TOMBSTONE_BITS = 65536
+
+
+def retired_boot(state, boot_id):
+    bits = int(state["control"].get("retired_boots", "0"), 16)
+    value = hashlib.sha256(boot_id.encode()).digest()
+    return all(bits & (1 << (int.from_bytes(value[i:i+4], "big") % TOMBSTONE_BITS))
+               for i in (0, 4, 8, 12))
+
+
+def compress_completed(state, seq):
+    state = copy.deepcopy(state)
+    changed = False
+    protected = set(state["pending_txs"])
+    protected.update(key for key, item in state["intents"].items()
+                     if not item["consumed"] and not item["cancelled"])
+    for record in state["pending_txs"].values():
+        protected.add(record.get("intent"))
+    completed = [key for key in state["intents"] if key not in protected]
+    for key in completed[:-HISTORY_LIMIT]:
+        del state["intents"][key]
+        state["reoff_attempts"].pop(key, None)
+        state["quarantined_intents"].pop(key, None)
+        changed = True
+    boots = state["reconciled_boot_ids"]
+    retired = boots[:-HISTORY_LIMIT]
+    if retired:
+        bits = int(state["control"].get("retired_boots", "0"), 16)
+        for boot in retired:
+            value = hashlib.sha256(boot.encode()).digest()
+            for i in (0, 4, 8, 12):
+                bits |= 1 << (int.from_bytes(value[i:i+4], "big") % TOMBSTONE_BITS)
+            state["boots"].pop(boot, None)
+            state["reoff_candidates"].pop(boot, None)
+        state["control"]["retired_boots"] = format(bits, "x")
+        state["reconciled_boot_ids"] = boots[-HISTORY_LIMIT:]
+        changed = True
+    # Preserve arm evidence referenced by live transactions/intents and the
+    # current protection session; all other completed arms are covered by seq.
+    arms = {state["armed_arm_id"], state["last_protection_arm"]}
+    for record in state["pending_txs"].values():
+        arms.update((record.get("arm_id"), record.get("previous_arm_id")))
+    for key in protected:
+        if key in state["intents"]:
+            arms.add(state["intents"][key]["record"].get("arm_id"))
+    for key in list(state["consumed_arms"])[:-HISTORY_LIMIT]:
+        if key not in arms:
+            del state["consumed_arms"][key]
+            changed = True
+    superseded = state["superseded_arms"]
+    if len(superseded) > HISTORY_LIMIT:
+        state["superseded_arms"] = [arm for arm in superseded[:-HISTORY_LIMIT] if arm in arms] + superseded[-HISTORY_LIMIT:]
+        changed = True
+    if len(state["fault_flags"]) > HISTORY_LIMIT:
+        state["fault_flags"] = state["fault_flags"][-HISTORY_LIMIT:]
+        changed = True
+    state["intent_wait"] = [key for key in dict.fromkeys(state["intent_wait"])
+                            if key in protected or key in state["intents"]]
+    if changed:
+        state["control"]["completed_through_seq"] = seq
+    return state
+
+
 @dataclass
 class LoadResult:
     status: LoadStatus
@@ -233,6 +300,7 @@ class Ledger:
         return self.load()
 
     def _switch(self, state, seq, checksum, generation):
+        state = compress_completed(state, seq)
         snap = dict(version=1, generation=generation, seq=seq,
                     checksum=checksum, state=state)
         envelope = dict(payload=snap, checksum=digest(snap))
@@ -371,6 +439,7 @@ class Ledger:
                 self.storage.usage() + len(data) + reserve > self.storage.quota):
             self.compact()
             loaded = self.load()
+            next_state = reduce_record(loaded.state, record)
         try:
             self.storage.ensure_space(len(data) + reserve)
             self.storage.append_record(loaded.head["tail"], data)

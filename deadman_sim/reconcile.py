@@ -4,7 +4,7 @@ import uuid
 from .budget import settle
 from .classify import Evidence, classify
 from .engine import HardwareFailure
-from .ledger import LoadStatus, State
+from .ledger import LoadStatus, State, retired_boot
 
 
 def reconcile(module, evidence=None):
@@ -17,6 +17,9 @@ def reconcile(module, evidence=None):
     if module.boot_id in state["reconciled_boot_ids"]:
         module.ledger.write_cache()
         return dict(success=True, repeated=True, **state["boots"][module.boot_id])
+    if retired_boot(state, module.boot_id):
+        # Forgotten results cannot authorize another consumption or REOFF.
+        return dict(success=False, error="retired/ambiguous boot identity")
     current_intents = [item for item in state["intents"].values()
                        if item["record"]["source_boot_id"] == module.boot_id and
                        not item["consumed"] and not item["cancelled"]]

@@ -99,6 +99,7 @@ class Transaction:
         final = result.get("final_state")
         if final:
             result["state"] = final
+        result["control"] = dict(cleanup_pending=False)
         module.crash.hit("before_commit")
         record = self.persist("COMMITTED", readback=slot, result=result)
         module.crash.hit("after_commit")

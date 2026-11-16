@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import errno
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ class Storage:
         self.crash = crash or CrashInjector()
         self.failures = {}
         self.peak_usage = 0
+        self.guard_enabled = False
         self._check(self.root)
         if self.root.exists() and (not self.root.is_dir() or
                                    self.root.stat().st_mode & 0o077):
@@ -95,51 +97,101 @@ class Storage:
         with os.fdopen(fd, "rb") as stream:
             return stream.read()
 
-    def atomic_write(self, name, data):
-        p = self.path(name)
-        self.ensure_space(len(data))
-        fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=self.root)
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                os.fchmod(stream.fileno(), 0o600)
-                stream.write(data)
-                stream.flush()
-                self._fsync(stream.fileno())
-            self.crash.hit(name + ":file_fsynced")
-            self._fault("rename")
-            self.crash.hit(name + ":before_rename")
-            os.replace(tmp, p)
-            self.crash.hit(name + ":renamed")
-            self.sync_dir()
-            self.crash.hit(name + ":dir_fsynced")
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+    @contextmanager
+    def mutation(self):
+        # A durable write-ahead fence survives even when the failing filesystem
+        # cannot accept a subsequent FAULT record. Only trusted repair clears it.
+        if not self.guard_enabled:
+            yield
+            return
+        marker = self.path("IO-UNCERTAIN")
+        existing = marker.exists()
+        if not existing:
+            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(fd, b"explicit repair required\n")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            self._sync_guard_directory()
+        yield
+        if not existing:
+            self.clear_uncertainty()
 
-    def append_record(self, name, data):
-        p = self.path(name)
-        self.ensure_space(len(data))
-        created = not p.exists()
-        fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "ab") as stream:
-            stream.write(data)
-            stream.flush()
-            self._fsync(stream.fileno())
-        self.crash.hit(name + ":appended_fsynced")
-        if created:
-            self.sync_dir()
-
-    def truncate(self, name, offset):
-        fd = os.open(self.path(name), os.O_WRONLY | os.O_NOFOLLOW)
+    def _sync_guard_directory(self):
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            os.ftruncate(fd, offset)
-            self._fsync(fd)
+            os.fsync(fd)
         finally:
             os.close(fd)
 
+    def clear_uncertainty(self):
+        marker = self.path("IO-UNCERTAIN")
+        if marker.exists():
+            marker.unlink()
+            try:
+                self._sync_guard_directory()
+            except OSError:
+                # A failed fence removal must not look like successful repair
+                # to a new process. Restore the gate before reporting failure.
+                fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+                try:
+                    os.write(fd, b"explicit repair required\n")
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                self._sync_guard_directory()
+                raise
+
+    def atomic_write(self, name, data):
+        with self.mutation():
+            p = self.path(name)
+            self.ensure_space(len(data))
+            fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=self.root)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    os.fchmod(stream.fileno(), 0o600)
+                    stream.write(data)
+                    stream.flush()
+                    self._fsync(stream.fileno())
+                self.crash.hit(name + ":file_fsynced")
+                self._fault("rename")
+                self.crash.hit(name + ":before_rename")
+                os.replace(tmp, p)
+                self.crash.hit(name + ":renamed")
+                self.sync_dir()
+                self.crash.hit(name + ":dir_fsynced")
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+
+    def append_record(self, name, data):
+        with self.mutation():
+            p = self.path(name)
+            self.ensure_space(len(data))
+            created = not p.exists()
+            fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "ab") as stream:
+                stream.write(data)
+                stream.flush()
+                self._fsync(stream.fileno())
+            self.crash.hit(name + ":appended_fsynced")
+            if created:
+                self.sync_dir()
+
+    def truncate(self, name, offset):
+        with self.mutation():
+            fd = os.open(self.path(name), os.O_WRONLY | os.O_NOFOLLOW)
+            try:
+                os.ftruncate(fd, offset)
+                self._fsync(fd)
+            finally:
+                os.close(fd)
+
     def delete(self, name):
-        self.path(name).unlink()
-        self.sync_dir()
+        with self.mutation():
+            self.path(name).unlink()
+            self.sync_dir()
 
     def remove_directory(self):
         for path in tuple(self.root.iterdir()):
